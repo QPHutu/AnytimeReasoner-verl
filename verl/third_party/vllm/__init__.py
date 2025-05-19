@@ -56,7 +56,7 @@ elif vs.parse(package_version) >= vs.parse('0.7.0'):
     # From 0.6.6.post2 on, vllm supports SPMD inference
     # See https://github.com/vllm-project/vllm/pull/12071
 
-    from vllm import LLM
+    from verl.trainer.ppo.brpo import LLM
     from vllm.distributed import parallel_state
 else:
     raise ValueError(

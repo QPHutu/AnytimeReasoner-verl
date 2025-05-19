@@ -24,6 +24,7 @@ actor_rollout_ref:
     use_remove_padding: False
   actor:
     strategy: fsdp  # This is for backward-compatibility
+    attn_implementation: flash_attention_2
     ppo_mini_batch_size: 256
     ppo_micro_batch_size: null # will be deprecated, use ppo_micro_batch_size_per_gpu
     ppo_micro_batch_size_per_gpu: null
@@ -93,6 +94,12 @@ actor_rollout_ref:
     do_sample: True
     # number of responses (i.e. num sample times)
     n: 1 # > 1 for grpo
+    n_summary: 1
+    n_budget_support: 1
+    max_gen_len: 8000
+    budget_probs: "base"
+    summary_method: "brpo"
+    variance_reduction: "brpo"
     val_kwargs:
       # sampling parameters for validation
       top_k: -1 # 0 for hf rollout, -1 for vllm rollout
@@ -190,4 +197,4 @@ trainer:
   default_hdfs_dir: null
   remove_previous_ckpt_in_save: False
   del_local_ckpt_after_load: False
-  default_local_dir: checkpoints/${trainer.project_name}/${trainer.experiment_name}
+  default_local_dir: checkpoints/${trainer.project_name}/${trainer.experiment_name}/v${actor_rollout_ref.rollout.variance_reduction}-s${actor_rollout_ref.rollout.n_summary}-b${actor_rollout_ref.rollout.n_budget_support}-${actor_rollout_ref.rollout.budget_probs}

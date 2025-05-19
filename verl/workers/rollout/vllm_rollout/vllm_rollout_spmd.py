@@ -25,6 +25,7 @@ When working with Megatron:
 - After inference, all the parameters that doesn't belong to this pp rank is freed.
 """
 import numpy as np
+import os
 from typing import List
 from contextlib import contextmanager
 from omegaconf import DictConfig
@@ -34,11 +35,14 @@ from tensordict import TensorDict
 from torch import nn
 from typing import Any, Union
 from verl import DataProto
-from verl.utils.torch_functional import get_eos_mask, pad_2d_list_to_length
+from verl.utils.torch_functional import pad_2d_list_to_length
 from verl.workers.rollout.base import BaseRollout
 from vllm.distributed import parallel_state as vllm_ps
 from vllm import LLM, SamplingParams
 from verl.third_party.vllm import vllm_version
+from verl.third_party.vllm import LLM, vllm_version
+from verl.trainer.ppo.brpo import get_split_points, set_cot_num, get_think_end_id, set_is_training, set_training_split_plan, set_variance_reduction, set_summary_method
+from verl.models.transformers.flex_attn import BLOCK_SIZE
 
 # TODO
 # 1. support pp in vllm
@@ -113,6 +117,8 @@ class vLLMRollout(BaseRollout):
             enable_chunked_prefill=config.enable_chunked_prefill,
             enable_prefix_caching=True,
         )
+        self.inference_engine.reward_tokenizer = tokenizer
+        self.inference_engine.apply_model(lambda model: print(model.__class__))
 
         # Offload vllm model to reduce peak memory usage
         self.inference_engine.sleep(level=1)
@@ -134,24 +140,38 @@ class vLLMRollout(BaseRollout):
 
         print(f"kwargs: {kwargs}")
         self.sampling_params = SamplingParams(**kwargs)
+        set_training_split_plan(
+            max_gen_len=config.max_gen_len,
+            n_budget_support=config.n_budget_support,
+            budget_probs=config.budget_probs,
+        )
 
         self.pad_token_id = tokenizer.pad_token_id
 
     @contextmanager
     def update_sampling_params(self, **kwargs):
+        old_sampling_params = self.sampling_params.clone()
         # update sampling params
-        old_sampling_params_args = {}
         if kwargs:
             for key, value in kwargs.items():
                 if hasattr(self.sampling_params, key):
-                    old_value = getattr(self.sampling_params, key)
-                    old_sampling_params_args[key] = old_value
                     setattr(self.sampling_params, key, value)
+        self.split_params = self.sampling_params.clone()
+        # self.sampling_params.stop = ["</think>"]
+        self.sampling_params.stop_token_ids = [get_think_end_id()]
+        self.sampling_params.include_stop_str_in_output = True
+        set_cot_num(self.config.n)
+        set_variance_reduction(self.config.variance_reduction)
+        set_summary_method(self.config.summary_method)
+        split_points = get_split_points()
+        summary_n = self.config.n_summary
+        self.split_params.n = summary_n
+        self.sampling_params.n = self.config.n
+        self.sampling_params.max_tokens = split_points[-1]
         yield
         # roll back to previous sampling params
         # if len(old_sampling_params_args):
-        for key, value in old_sampling_params_args.items():
-            setattr(self.sampling_params, key, value)
+        self.sampling_params = old_sampling_params
 
     @torch.no_grad()
     def generate_sequences(self, prompts: DataProto, **kwargs) -> DataProto:
@@ -163,9 +183,6 @@ class vLLMRollout(BaseRollout):
         # left-padded attention_mask
         attention_mask = prompts.batch['attention_mask']
         position_ids = prompts.batch['position_ids']
-
-        # used to construct attention_mask
-        eos_token_id = prompts.meta_info['eos_token_id']
 
         batch_size = idx.size(0)
 
@@ -189,9 +206,10 @@ class vLLMRollout(BaseRollout):
 
         do_sample = prompts.meta_info.get('do_sample', True)
         is_validate = prompts.meta_info.get('validate', False)
+        set_is_training(not is_validate)
         if not do_sample:
             kwargs = {
-                'best_of': 1,
+                # 'best_of': 1,
                 'top_p': 1.0,
                 'top_k': -1,
                 'min_p': 0.0,
@@ -209,58 +227,78 @@ class vLLMRollout(BaseRollout):
 
         # users can customize different sampling_params at different run
         with self.update_sampling_params(**kwargs):
-            outputs = self.inference_engine.generate(
+            self.inference_engine.sampling_params = self.split_params
+            ground_truth_list = []
+            for i in range(len(prompts)):
+                ground_truth_list.append(prompts[i].non_tensor_batch['reward_model']['ground_truth'])
+            non_tensor_batch.pop("reward_model")
+            self.inference_engine.ground_truth_list = ground_truth_list
+            response, output_tuple, output_metrics = self.inference_engine.generate(
                 prompts=vllm_inputs,  # because we have already convert it to prompt token id
                 sampling_params=self.sampling_params,
                 use_tqdm=False)
 
-            # TODO(sgm): disable logprob when recompute_log_prob is enable
-            # if n = 1: (bs, response_length) ; if n > 1: (bs * n, response_length)
+            if is_validate:
+                response = [resp[:self.config.response_length] for resp in response]
+            response = pad_2d_list_to_length(response, self.pad_token_id, max_length=self.config.response_length)
+            response = response.to(idx.device)
+            assert response.shape[-1] <= self.config.response_length
+            output_list = []
+            for out in output_tuple:
+                if is_validate:
+                    out = [_out[:self.config.response_length] for _out in out]
+                padded_out = pad_2d_list_to_length(out, 0, max_length=self.config.response_length)
+                padded_out = padded_out.to(idx.device)
+                assert padded_out.shape[-1] <= self.config.response_length
+                output_list.append(padded_out)
+            metrics_dict = {}
+            for key, value in output_metrics.items():
+                metrics_dict[key] = value.to(idx.device)
 
-            response = []
-            for output in outputs:
-                for sample_id in range(len(output.outputs)):
-                    response.append(output.outputs[sample_id].token_ids)
-
-            response = pad_2d_list_to_length(response, self.pad_token_id,
-                                             max_length=self.config.response_length).to(idx.device)
-
-            if self.sampling_params.n > 1 and do_sample:
-                idx = _repeat_interleave(idx, self.sampling_params.n)
-                attention_mask = _repeat_interleave(attention_mask, self.sampling_params.n)
-                position_ids = _repeat_interleave(position_ids, self.sampling_params.n)
-                batch_size = batch_size * self.sampling_params.n
+            if self.config.n > 1 and do_sample:
+                idx = _repeat_interleave(idx, self.config.n)
+                attention_mask = _repeat_interleave(attention_mask, self.config.n)
+                position_ids = _repeat_interleave(position_ids, self.config.n)
+                batch_size = batch_size * self.config.n
+                assert response.size(0) == batch_size, f"{response.size(0)} != {batch_size}"
+                assert idx.size(0) == batch_size
                 if 'multi_modal_inputs' in non_tensor_batch.keys():
                     non_tensor_batch['multi_modal_inputs'] = _repeat_interleave(non_tensor_batch['multi_modal_inputs'],
-                                                                                self.sampling_params.n)
+                                                                                self.config.n)
 
             seq = torch.cat([idx, response], dim=-1)
 
-        response_length = response.size(1)
-        delta_position_id = torch.arange(1, response_length + 1, device=position_ids.device)
-        delta_position_id = delta_position_id.unsqueeze(0).expand(batch_size, -1)
-        if position_ids.dim() == 3:  # qwen2vl mrope
-            delta_position_id = delta_position_id.view(batch_size, 1, -1).expand(batch_size, 3, -1)
-
-        # TODO(sgm): fix position_ids on right_pad
+        valid_response_mask, response_position_ids, tree_invalid_start, tree_invalid_end, token_level_adv, trainable_mask = tuple(output_list)
         # prompt: left pad + response: right pad
         # attention_mask: [0,0,0,0,1,1,1,1, | 1,1,1,0,0,0,0,0]
         # position_ids:   [0,0,0,0,0,1,2,3, | 4,5,6,7,8,9,10,11]
-        response_position_ids = position_ids[:, -1:] + delta_position_id
+        response_position_ids = position_ids[:, -1:] + 1 + response_position_ids
         position_ids = torch.cat([position_ids, response_position_ids], dim=-1)
-        response_attention_mask = get_eos_mask(response_id=response, eos_token=eos_token_id, dtype=attention_mask.dtype)
-        attention_mask = torch.cat((attention_mask, response_attention_mask), dim=-1)
+        attention_mask = torch.cat((attention_mask, valid_response_mask), dim=-1)
+        response_invalid_slice = torch.stack([tree_invalid_start, tree_invalid_end], dim=-1)
+        prompt_invalid_slice = torch.zeros((*idx.shape, 2), dtype=torch.long, device=idx.device)
+        tree_invalid_slice = torch.concat([prompt_invalid_slice, response_invalid_slice], dim=1)
+        # token_level_adv = torch.cat(
+        #     [torch.zeros_like(idx, dtype=torch.float32, device=idx.device), token_level_adv], dim=-1)
+        # trainable_mask = torch.cat(
+        #     [torch.zeros_like(idx, dtype=torch.long, device=idx.device), trainable_mask], dim=-1)
 
         # all the tp ranks should contain the same data here. data in all ranks are valid
-        batch = TensorDict(
-            {
+
+        tensor_dict = {
                 'prompts': idx,
                 'responses': response,
                 'input_ids': seq,  # here input_ids become the whole sentences
                 # 'old_log_probs': log_probs, # we will recompute old log prob with actor
                 'attention_mask': attention_mask,
-                'position_ids': position_ids
-            },
+                'position_ids': position_ids,
+                'tree_invalid_slice': tree_invalid_slice,
+                'advantages': token_level_adv,
+                'trainable_mask': trainable_mask,
+            }
+        tensor_dict.update(metrics_dict)
+        batch = TensorDict(
+            tensor_dict,
             batch_size=batch_size)
 
         # free vllm cache engine

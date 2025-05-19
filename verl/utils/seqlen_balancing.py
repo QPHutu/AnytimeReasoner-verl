@@ -230,18 +230,32 @@ def rearrange_micro_batches(batch: TensorDict, max_token_len, dp_group=None):
     assert max_token_len >= max_seq_len, \
         f'max_token_len must be greater than the sequence length. Got {max_token_len=} and {max_seq_len=}'
 
-    seq_len_effective: torch.Tensor = batch['attention_mask'].sum(dim=1)
-    total_seqlen = seq_len_effective.sum().item()
+    seq_len_effective = batch['attention_mask'].sum(dim=1).tolist()
+
+    total_seqlen = sum(seq_len_effective)
     num_micro_batches = ceildiv(total_seqlen, max_token_len)
     if dist.is_initialized():
         num_micro_batches = torch.tensor([num_micro_batches], device='cuda')
         dist.all_reduce(num_micro_batches, op=dist.ReduceOp.MAX, group=dp_group)
         num_micro_batches = num_micro_batches.cpu().item()
 
-    seq_len_effective = seq_len_effective.tolist()
-    assert num_micro_batches <= len(seq_len_effective)
-
-    micro_bsz_idx = get_seqlen_balanced_partitions(seq_len_effective, num_micro_batches, equal_size=False)
+    while True:
+        # micro_bsz_idx = get_partitions(seq_len_effective, max_token_len, num_micro_batches)
+        micro_bsz_idx = get_seqlen_balanced_partitions(seq_len_effective, num_micro_batches, equal_size=False)
+        check_failed = False
+        for partition in micro_bsz_idx:
+            cur_sum = sum([seq_len_effective[i] for i in partition])
+            if cur_sum > max_token_len:
+                check_failed = True
+                break
+        actual_size = num_micro_batches + 1 if check_failed else len(micro_bsz_idx)
+        if dist.is_initialized():
+            actual_size = torch.tensor([actual_size], device='cuda')
+            dist.all_reduce(actual_size, op=dist.ReduceOp.MAX, group=dp_group)
+            actual_size = actual_size.cpu().item()
+        if actual_size == num_micro_batches:
+            break
+        num_micro_batches += 1
 
     micro_batches = []
 

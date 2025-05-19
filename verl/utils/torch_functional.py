@@ -120,6 +120,10 @@ def masked_mean(values, mask, axis=None):
     return (values * mask).sum(axis=axis) / mask.sum(axis=axis)
 
 
+def just_mean(values, mask, axis=None):
+    return (values * mask).mean(axis=axis)
+
+
 def masked_var(values, mask, unbiased=True):
     """Compute variance of tensor with masked values."""
     mean = masked_mean(values, mask)

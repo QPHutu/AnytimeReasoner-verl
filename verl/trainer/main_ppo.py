@@ -18,35 +18,12 @@ from verl.trainer.ppo.ray_trainer import RayPPOTrainer
 
 import ray
 import hydra
+import torch
+import logging
 
+from verl import DataProto
 
-def get_custom_reward_fn(config):
-    import importlib.util, os
-
-    reward_fn_config = config.get("custom_reward_function") or {}
-    file_path = reward_fn_config.get("path")
-    if not file_path:
-        return None
-
-    if not os.path.exists(file_path):
-        raise FileNotFoundError(f"Reward function file '{file_path}' not found.")
-
-    spec = importlib.util.spec_from_file_location("custom_module", file_path)
-    module = importlib.util.module_from_spec(spec)
-    try:
-        spec.loader.exec_module(module)
-    except Exception as e:
-        raise RuntimeError(f"Error loading module from '{file_path}': {e}")
-
-    function_name = reward_fn_config.get("name")
-
-    if not hasattr(module, function_name):
-        raise AttributeError(f"Reward function '{function_name}' not found in '{file_path}'.")
-
-    print(f"using customized reward function '{function_name}' from '{file_path}'")
-
-    return getattr(module, function_name)
-
+logger = logging.getLogger(__name__)
 
 @hydra.main(config_path='config', config_name='ppo_trainer', version_base=None)
 def main(config):
@@ -57,13 +34,17 @@ def run_ppo(config) -> None:
 
     if not ray.is_initialized():
         # this is for local ray cluster
-        ray.init(runtime_env={
-            'env_vars': {
-                'TOKENIZERS_PARALLELISM': 'true',
-                'NCCL_DEBUG': 'WARN',
-                'VLLM_LOGGING_LEVEL': 'WARN'
+        logger.info("start to init ray")
+        ray.init(
+            num_cpus=64, num_gpus=8, runtime_env={
+                'env_vars': {
+                    'TOKENIZERS_PARALLELISM': 'true',
+                    'NCCL_DEBUG': 'WARN',
+                    'VLLM_LOGGING_LEVEL': 'WARN'
+                }
             }
-        })
+        )
+        logger.info("init ray done")
 
     ray.get(main_task.remote(config))
 
@@ -106,7 +87,7 @@ def main_task(config):
     role_worker_mapping = {
         Role.ActorRollout: ray.remote(ActorRolloutRefWorker),
         Role.Critic: ray.remote(CriticWorker),
-        Role.RefPolicy: ray.remote(ActorRolloutRefWorker)
+        # Role.RefPolicy: ray.remote(ActorRolloutRefWorker)
     }
 
     global_pool_id = 'global_pool'
@@ -116,7 +97,7 @@ def main_task(config):
     mapping = {
         Role.ActorRollout: global_pool_id,
         Role.Critic: global_pool_id,
-        Role.RefPolicy: global_pool_id,
+        # Role.RefPolicy: global_pool_id,
     }
 
     # we should adopt a multi-source reward function here
@@ -135,22 +116,6 @@ def main_task(config):
         role_worker_mapping[Role.RewardModel] = ray.remote(RewardModelWorker)
         mapping[Role.RewardModel] = global_pool_id
 
-    reward_manager_name = config.reward_model.get("reward_manager", "naive")
-    if reward_manager_name == 'naive':
-        from verl.workers.reward_manager import NaiveRewardManager
-        reward_manager_cls = NaiveRewardManager
-    elif reward_manager_name == 'prime':
-        from verl.workers.reward_manager import PrimeRewardManager
-        reward_manager_cls = PrimeRewardManager
-    else:
-        raise NotImplementedError
-
-    compute_score = get_custom_reward_fn(config)
-    reward_fn = reward_manager_cls(tokenizer=tokenizer, num_examine=0, compute_score=compute_score)
-
-    # Note that we always use function-based RM for validation
-    val_reward_fn = reward_manager_cls(tokenizer=tokenizer, num_examine=1, compute_score=compute_score)
-
     resource_pool_manager = ResourcePoolManager(resource_pool_spec=resource_pool_spec, mapping=mapping)
 
     trainer = RayPPOTrainer(config=config,
@@ -159,8 +124,8 @@ def main_task(config):
                             role_worker_mapping=role_worker_mapping,
                             resource_pool_manager=resource_pool_manager,
                             ray_worker_group_cls=ray_worker_group_cls,
-                            reward_fn=reward_fn,
-                            val_reward_fn=val_reward_fn)
+                            reward_fn=None,
+                            val_reward_fn=None)
     trainer.init_workers()
     trainer.fit()
 

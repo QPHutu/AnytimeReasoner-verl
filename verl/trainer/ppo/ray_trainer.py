@@ -16,6 +16,7 @@ FSDP PPO Trainer with Ray-based single controller.
 This trainer supports model-agonistic model initialization with huggingface
 """
 
+from collections import defaultdict
 import os
 import uuid
 from contextlib import contextmanager
@@ -27,6 +28,7 @@ from copy import deepcopy
 
 import ray
 import numpy as np
+import time
 from codetiming import Timer
 from omegaconf import OmegaConf, open_dict
 from verl import DataProto
@@ -239,9 +241,11 @@ def compute_advantage(data: DataProto, adv_estimator, gamma=1.0, lam=1.0, num_re
 
 @contextmanager
 def _timer(name: str, timing_raw: Dict[str, float]):
+    print("start to", name)
     with Timer(name=name, logger=None) as timer:
         yield
     timing_raw[name] = timer.last
+    print(name, "complete")
 
 
 class RayPPOTrainer(object):
@@ -416,7 +420,7 @@ class RayPPOTrainer(object):
         # use sampler for better ckpt resume
         if self.config.data.shuffle:
             train_dataloader_generator = torch.Generator()
-            train_dataloader_generator.manual_seed(self.config.data.get('seed', 1))
+            train_dataloader_generator.manual_seed(self.config.data.get('seed', 42))
             sampler = RandomSampler(data_source=self.train_dataset, generator=train_dataloader_generator)
         else:
             sampler = SequentialSampler(data_source=self.train_dataset)
@@ -444,7 +448,7 @@ class RayPPOTrainer(object):
             # which will schedule the memory themselves.
             batch_size=len(self.val_dataset),
             num_workers=8,
-            shuffle=False,
+            shuffle=True,
             drop_last=False,
             collate_fn=collate_fn)
 
@@ -476,15 +480,11 @@ class RayPPOTrainer(object):
 
         if generations_to_log == 0:
             return
-
-        import numpy as np
-
         # Create tuples of (input, output, score) and sort by input text
         samples = list(zip(inputs, outputs, scores))
         samples.sort(key=lambda x: x[0])  # Sort by input text
 
-        # Use fixed random seed for deterministic shuffling
-        rng = np.random.RandomState(42)
+        rng = np.random.RandomState(int(time.time()))
         rng.shuffle(samples)
 
         # Take first N samples after shuffling
@@ -494,14 +494,12 @@ class RayPPOTrainer(object):
         self.validation_generations_logger.log(self.config.trainer.logger, samples, self.global_steps)
 
     def _validate(self):
-        reward_tensor_lst = []
-        data_source_lst = []
-
         # Lists to collect samples for the table
         sample_inputs = []
         sample_outputs = []
         sample_scores = []
 
+        data_source_metrics = defaultdict(lambda: defaultdict(list))
         for test_data in self.val_dataloader:
             test_batch = DataProto.from_single_dict(test_data)
 
@@ -513,21 +511,18 @@ class RayPPOTrainer(object):
             if self.config.reward_model.enable and test_batch[0].non_tensor_batch['reward_model']['style'] == 'model':
                 return {}
 
-            # Store original inputs
-            input_ids = test_batch.batch['input_ids']
-            input_texts = [self.tokenizer.decode(ids, skip_special_tokens=True) for ids in input_ids]
-            sample_inputs.extend(input_texts)
-
             if 'multi_modal_inputs' in test_batch.non_tensor_batch.keys():
                 test_gen_batch = test_batch.pop(
                     batch_keys=['input_ids', 'attention_mask', 'position_ids'],
-                    non_tensor_batch_keys=['raw_prompt_ids', 'multi_modal_data', 'multi_modal_inputs'],
+                    non_tensor_batch_keys=['raw_prompt_ids', 'reward_model', 'multi_modal_data', 'multi_modal_inputs'],
                 )
             else:
+                reward_model = test_batch.select(non_tensor_batch_keys=['reward_model'])
                 test_gen_batch = test_batch.pop(
                     batch_keys=['input_ids', 'attention_mask', 'position_ids'],
-                    non_tensor_batch_keys=['raw_prompt_ids'],
+                    non_tensor_batch_keys=['raw_prompt_ids', 'reward_model'],
                 )
+                test_batch = test_batch.union(reward_model)
 
             test_gen_batch.meta_info = {
                 'eos_token_id': self.tokenizer.eos_token_id,
@@ -538,49 +533,144 @@ class RayPPOTrainer(object):
             }
             print(f'test_gen_batch meta info: {test_gen_batch.meta_info}')
 
+            n_val_samples = self.config.actor_rollout_ref.rollout.n
+            test_batch.non_tensor_batch['uid'] = np.array([str(uuid.uuid4()) for _ in range(len(test_batch.batch))], dtype=object)
+            test_batch = test_batch.repeat(repeat_times=n_val_samples, interleave=True)
+
             # pad to be divisible by dp_size
             test_gen_batch_padded, pad_size = pad_dataproto_to_divisor(test_gen_batch, self.actor_rollout_wg.world_size)
             test_output_gen_batch_padded = self.actor_rollout_wg.generate_sequences(test_gen_batch_padded)
 
             # unpad
-            test_output_gen_batch = unpad_dataproto(test_output_gen_batch_padded, pad_size=pad_size)
+            test_output_gen_batch = unpad_dataproto(test_output_gen_batch_padded, pad_size=pad_size * n_val_samples)
             print('validation generation end')
-
-            # Store generated outputs
-            output_ids = test_output_gen_batch.batch['responses']
-            output_texts = [self.tokenizer.decode(ids, skip_special_tokens=True) for ids in output_ids]
-            sample_outputs.extend(output_texts)
 
             test_batch = test_batch.union(test_output_gen_batch)
 
-            # evaluate using reward_function
-            reward_tensor = self.val_reward_fn(test_batch)
+            keys = [
+                "no_think_end",
+                "is_formatted",
+                "budget_scores",
+                "final_count",
+                "final_scores",
+                "cot_length",
+                "summary_length",
+                "cot_v1",
+                "cot_v2",
+                "cot_rt",
+                "cot_mask",
+                "brpo_adv",
+                "grpo_adv",
+            ]
+            data_dict = {
+                k: test_batch.batch[k] for k in keys
+            }
+            batch_size = data_dict['no_think_end'].shape[0]
+            ds = test_batch.non_tensor_batch.get('data_source', ['unknown'] * batch_size)
+            gt = test_batch.non_tensor_batch['reward_model']
 
-            # Store scores
-            scores = reward_tensor.sum(-1).cpu().tolist()
-            sample_scores.extend(scores)
+            # Store for log
+            input_ids = test_batch.batch['input_ids']
+            input_texts = [self.tokenizer.decode(ids, skip_special_tokens=True) for ids in input_ids]
+            sample_inputs.extend(input_texts)
+            sample_outputs.extend([ds[_] for _ in range(len(ds))])
+            sample_scores.extend([str(gt[_]['ground_truth']) for _ in range(len(gt))])
 
-            reward_tensor_lst.append(reward_tensor)
-            data_source_lst.append(test_batch.non_tensor_batch.get('data_source', ['unknown'] * reward_tensor.shape[0]))
+            for i in range(batch_size):
+                data_source = ds[i]
+                for k in keys:
+                    data_source_metrics[data_source][k].append(data_dict[k][i])
 
         self._maybe_log_val_generations(inputs=sample_inputs, outputs=sample_outputs, scores=sample_scores)
 
-        reward_tensor = torch.cat(reward_tensor_lst, dim=0).sum(-1).cpu()  # (batch_size,)
-        data_sources = np.concatenate(data_source_lst, axis=0)
+        metrics_with_ds_prefix = {}
+        for data_source, data_dict in data_source_metrics.items():
+            split_scores = torch.stack(data_dict['budget_scores'], dim=0)
+            final_split_cnt = torch.stack(data_dict['final_count'], dim=0)
+            final_split_scores = torch.stack(data_dict['final_scores'], dim=0)
+            no_think_end = torch.stack(data_dict['no_think_end'], dim=0)
+            is_formatted = torch.stack(data_dict['is_formatted'], dim=0)
+            cot_length = torch.stack(data_dict['cot_length'], dim=0)
+            summary_length = torch.stack(data_dict['summary_length'], dim=0)
+            cot_v1 = torch.stack(data_dict['cot_v1'], dim=0)
+            cot_v2 = torch.stack(data_dict['cot_v2'], dim=0)
+            cot_rt = torch.stack(data_dict['cot_rt'], dim=0)
+            cot_mask = torch.stack(data_dict['cot_mask'], dim=0)
+            brpo_adv = torch.stack(data_dict['brpo_adv'], dim=0)
+            grpo_adv = torch.stack(data_dict['grpo_adv'], dim=0)
+            cot_vv = cot_rt - brpo_adv
+            v1_adv = cot_rt - cot_v1
 
-        # evaluate test_score based on data source
-        data_source_reward = {}
-        for i in range(reward_tensor.shape[0]):
-            data_source = data_sources[i]
-            if data_source not in data_source_reward:
-                data_source_reward[data_source] = []
-            data_source_reward[data_source].append(reward_tensor[i].item())
+            split_size = split_scores.size(1)
+            metrics = {}
+            for i in range(split_size):
+                rt_avg = torch.sum(cot_rt[:, i] * cot_mask[:, i]) / (torch.sum(cot_mask[:, i]) + 1e-6)
+                rt_var = torch.sum((cot_rt[:, i] - rt_avg) ** 2 * cot_mask[:, i]) / (torch.sum(cot_mask[:, i]) + 1e-6)
 
-        metric_dict = {}
-        for data_source, rewards in data_source_reward.items():
-            metric_dict[f'val/test_score/{data_source}'] = np.mean(rewards)
+                brpo_adv_avg = torch.sum(brpo_adv[:, i] * cot_mask[:, i]) / (torch.sum(cot_mask[:, i]) + 1e-6)
+                brpo_adv_var = torch.sum((brpo_adv[:, i] - brpo_adv_avg) ** 2 * cot_mask[:, i]) / (torch.sum(cot_mask[:, i]) + 1e-6)
+                brpo_adv_var_norm = brpo_adv_var / (rt_var + 1e-6)
+                grpo_adv_avg = torch.sum(grpo_adv[:, i] * cot_mask[:, i]) / (torch.sum(cot_mask[:, i]) + 1e-6)
+                grpo_adv_var = torch.sum((grpo_adv[:, i] - grpo_adv_avg) ** 2 * cot_mask[:, i]) / (torch.sum(cot_mask[:, i]) + 1e-6)
+                grpo_adv_var_norm = grpo_adv_var / (rt_var + 1e-6)
+                v1_adv_avg = torch.sum(v1_adv[:, i] * cot_mask[:, i]) / (torch.sum(cot_mask[:, i]) + 1e-6)
+                v1_adv_var = torch.sum((v1_adv[:, i] - v1_adv_avg) ** 2 * cot_mask[:, i]) / (torch.sum(cot_mask[:, i]) + 1e-6)
+                v1_adv_var_norm = v1_adv_var / (rt_var + 1e-6)
 
-        return metric_dict
+                v1_avg = torch.sum(cot_v1[:, i] * cot_mask[:, i]) / (torch.sum(cot_mask[:, i]) + 1e-6)
+                v1_var = torch.sum((cot_v1[:, i] - v1_avg) ** 2 * cot_mask[:, i]) / (torch.sum(cot_mask[:, i]) + 1e-6)
+                v1_cov = torch.sum((cot_v1[:, i] - v1_avg) * (cot_rt[:, i] - rt_avg) * cot_mask[:, i]) / (torch.sum(cot_mask[:, i]) + 1e-6)
+                v1_cov_norm = v1_cov / (torch.sqrt(v1_var * rt_var) + 1e-6)
+
+                v2_avg = torch.sum(cot_v2[:, i] * cot_mask[:, i]) / (torch.sum(cot_mask[:, i]) + 1e-6)
+                v2_var = torch.sum((cot_v2[:, i] - v2_avg) ** 2 * cot_mask[:, i]) / (torch.sum(cot_mask[:, i]) + 1e-6)
+                v2_cov = torch.sum((cot_v2[:, i] - v2_avg) * (cot_rt[:, i] - rt_avg) * cot_mask[:, i]) / (torch.sum(cot_mask[:, i]) + 1e-6)
+                v2_cov_norm = v2_cov / (torch.sqrt(v2_var * rt_var) + 1e-6)
+
+                vv_avg = torch.sum(cot_vv[:, i] * cot_mask[:, i]) / (torch.sum(cot_mask[:, i]) + 1e-6)
+                vv_var = torch.sum((cot_vv[:, i] - vv_avg) ** 2 * cot_mask[:, i]) / (torch.sum(cot_mask[:, i]) + 1e-6)
+                vv_cov = torch.sum((cot_vv[:, i] - vv_avg) * (cot_rt[:, i] - rt_avg) * cot_mask[:, i]) / (torch.sum(cot_mask[:, i]) + 1e-6)
+                vv_cov_norm = vv_cov / (torch.sqrt(vv_var * rt_var) + 1e-6)
+
+                metrics[f'token_budget/{i}/rt_variance'] = rt_var.detach().item()
+                metrics[f'token_budget/{i}/brpo_adv_variance'] = brpo_adv_var_norm.detach().item()
+                metrics[f'token_budget/{i}/grpo_adv_variance'] = grpo_adv_var_norm.detach().item()
+                metrics[f'token_budget/{i}/v1_adv_variance'] = v1_adv_var_norm.detach().item()
+                metrics[f'token_budget/{i}/v1_cov'] = v1_cov_norm.detach().item()
+                metrics[f'token_budget/{i}/v2_cov'] = v2_cov_norm.detach().item()
+                metrics[f'token_budget/{i}/vv_cov'] = vv_cov_norm.detach().item()
+                metrics[f'token_budget/{i}/v1_variance'] = v1_var.detach().item()
+                metrics[f'token_budget/{i}/v2_variance'] = v2_var.detach().item()
+                metrics[f'token_budget/{i}/vv_variance'] = vv_var.detach().item()
+
+            metrics['max_summary_length'] = torch.amax(summary_length).detach().item()
+            metrics['avg_summary_length'] = torch.mean(summary_length).detach().item()
+            for i in range(split_size):
+                max_score_i = torch.amax(split_scores[:, :i+1], dim=-1)
+                metrics[f'token_budget/{i}/overthink_count'] = torch.sum(max_score_i > split_scores[:, i]).detach().item()
+                metrics[f'token_budget/{i}/max_score'] = torch.mean(max_score_i).detach().item()
+                metrics[f'token_budget/{i}/score'] = torch.mean(split_scores[:, i]).detach().item()
+                metrics[f'token_budget/{i}/is_formatted'] = torch.mean(is_formatted[:, i]).detach().item()
+
+                metrics[f'token_budget/{i}/cot_length'] = torch.mean(cot_length[:, i]).detach().item()
+
+                avg_final_score = torch.sum(final_split_scores[:, i]) / (torch.sum(final_split_cnt[:, i]) + 1e-6)
+                metrics[f'full_cot/{i}/score'] = avg_final_score.detach().item()
+                metrics[f'full_cot/{i}/count'] = torch.sum(final_split_cnt[:, i]).detach().item()
+                metrics[f'full_cot/{i}/no_think_end'] = torch.sum(no_think_end[:, i]).detach().item()
+            metrics[f'token_budget/avg_score'] = torch.mean(split_scores).detach().item()
+            metrics[f'token_budget/formatted_avg_score'] = (torch.sum(split_scores * is_formatted) / (torch.sum(is_formatted) + 1e-6)).detach().item()
+            avg_final_score = torch.sum(final_split_scores) / (torch.sum(final_split_cnt) + 1e-6)
+            metrics[f'full_cot/avg_score'] = avg_final_score.detach().item()
+            metrics[f'full_cot/no_think_end'] = torch.sum(no_think_end).detach().item()
+            # final_scores = torch.sum(final_split_scores, dim=-1)
+            no_think_end_avg_score = torch.sum(final_split_scores * no_think_end) / (torch.sum(no_think_end) + 1e-6)
+            metrics[f'full_cot/no_think_end_avg_score'] = no_think_end_avg_score.detach().item()
+
+            for k, v in metrics.items():
+                metrics_with_ds_prefix[f'val/{data_source}/{k}'] = v
+
+        return metrics_with_ds_prefix
 
     def init_workers(self):
         """Init resource pool and worker group"""
@@ -730,7 +820,7 @@ class RayPPOTrainer(object):
         # TODO: from remote not implemented yet
         dataloader_local_path = os.path.join(global_step_folder, 'data.pt')
         if os.path.exists(dataloader_local_path):
-            dataloader_state_dict = torch.load(dataloader_local_path)
+            dataloader_state_dict = torch.load(dataloader_local_path, weights_only=False)
             self.train_dataloader.load_state_dict(dataloader_state_dict)
         else:
             print(f"Warning: No dataloader state found at {dataloader_local_path}, will start from scratch")
@@ -761,8 +851,9 @@ class RayPPOTrainer(object):
         from verl.utils.tracking import Tracking
         from omegaconf import OmegaConf
 
+        rollout_conf = self.config.actor_rollout_ref.rollout
         logger = Tracking(project_name=self.config.trainer.project_name,
-                          experiment_name=self.config.trainer.experiment_name,
+                          experiment_name=f"{self.config.trainer.experiment_name}_v{rollout_conf.variance_reduction}-s{rollout_conf.n_summary}-b{rollout_conf.n_budget_support}-{rollout_conf.budget_probs}",
                           default_backend=self.config.trainer.logger,
                           config=OmegaConf.to_container(self.config, resolve=True))
 
@@ -773,15 +864,18 @@ class RayPPOTrainer(object):
 
         # perform validation before training
         # currently, we only support validation using the reward_function.
-        if self.val_reward_fn is not None and self.config.trainer.get('val_before_train', True):
-            val_metrics = self._validate()
-            pprint(f'Initial validation metrics: {val_metrics}')
-            logger.log(data=val_metrics, step=self.global_steps)
+        if self.config.trainer.get('val_before_train', True):
+            val_n = 10 if self.config.trainer.get('val_only', False) else 1
+            for _ in range(val_n):
+                val_metrics = self._validate()
+                pprint(f'Initial validation metrics: {val_metrics}')
+                logger.log(data=val_metrics, step=self.global_steps)
+                self.global_steps += 1
             if self.config.trainer.get('val_only', False):
                 return
 
         # we start from step 1
-        self.global_steps += 1
+        # self.global_steps += 1
         last_val_metrics = None
 
         for epoch in range(self.config.trainer.total_epochs):
@@ -795,12 +889,12 @@ class RayPPOTrainer(object):
                 if 'multi_modal_inputs' in batch.non_tensor_batch.keys():
                     gen_batch = batch.pop(
                         batch_keys=['input_ids', 'attention_mask', 'position_ids'],
-                        non_tensor_batch_keys=['raw_prompt_ids', 'multi_modal_data', 'multi_modal_inputs'],
+                        non_tensor_batch_keys=['raw_prompt_ids', 'reward_model', 'multi_modal_data', 'multi_modal_inputs'],
                     )
                 else:
                     gen_batch = batch.pop(
                         batch_keys=['input_ids', 'attention_mask', 'position_ids'],
-                        non_tensor_batch_keys=['raw_prompt_ids'],
+                        non_tensor_batch_keys=['raw_prompt_ids', 'reward_model'],
                     )
 
                 is_last_step = self.global_steps >= self.total_training_steps
@@ -810,21 +904,21 @@ class RayPPOTrainer(object):
                     with _timer('gen', timing_raw):
                         gen_batch_output = self.actor_rollout_wg.generate_sequences(gen_batch)
 
-                    if self.config.algorithm.adv_estimator == AdvantageEstimator.REMAX:
-                        with _timer('gen_max', timing_raw):
-                            gen_baseline_batch = deepcopy(gen_batch)
-                            gen_baseline_batch.meta_info['do_sample'] = False
-                            gen_baseline_output = self.actor_rollout_wg.generate_sequences(gen_baseline_batch)
+                    # if self.config.algorithm.adv_estimator == AdvantageEstimator.REMAX:
+                    #     with _timer('gen_max', timing_raw):
+                    #         gen_baseline_batch = deepcopy(gen_batch)
+                    #         gen_baseline_batch.meta_info['do_sample'] = False
+                    #         gen_baseline_output = self.actor_rollout_wg.generate_sequences(gen_baseline_batch)
 
-                            batch = batch.union(gen_baseline_output)
-                            reward_baseline_tensor = self.reward_fn(batch)
-                            reward_baseline_tensor = reward_baseline_tensor.sum(dim=-1)
+                    #         batch = batch.union(gen_baseline_output)
+                    #         reward_baseline_tensor = self.reward_fn(batch)
+                    #         reward_baseline_tensor = reward_baseline_tensor.sum(dim=-1)
 
-                            batch.pop(batch_keys=list(gen_baseline_output.batch.keys()))
+                    #         batch.pop(batch_keys=list(gen_baseline_output.batch.keys()))
 
-                            batch.batch['reward_baselines'] = reward_baseline_tensor
+                    #         batch.batch['reward_baselines'] = reward_baseline_tensor
 
-                            del gen_baseline_batch, gen_baseline_output
+                    #         del gen_baseline_batch, gen_baseline_output
 
                     batch.non_tensor_batch['uid'] = np.array([str(uuid.uuid4()) for _ in range(len(batch.batch))],
                                                              dtype=object)
@@ -868,24 +962,24 @@ class RayPPOTrainer(object):
                             batch = batch.union(reward_tensor)
 
                         # we combine with rule-based rm
-                        reward_tensor = self.reward_fn(batch)
-                        batch.batch['token_level_scores'] = reward_tensor
+                        # reward_tensor = self.reward_fn(batch)
+                        # batch.batch['token_level_scores'] = reward_tensor
 
                         # compute rewards. apply_kl_penalty if available
-                        if not self.config.actor_rollout_ref.actor.get('use_kl_loss', False):
-                            batch, kl_metrics = apply_kl_penalty(batch,
-                                                                 kl_ctrl=self.kl_ctrl,
-                                                                 kl_penalty=self.config.algorithm.kl_penalty)
-                            metrics.update(kl_metrics)
-                        else:
-                            batch.batch['token_level_rewards'] = batch.batch['token_level_scores']
+                        # if not self.config.actor_rollout_ref.actor.get('use_kl_loss', False):
+                        #     batch, kl_metrics = apply_kl_penalty(batch,
+                        #                                          kl_ctrl=self.kl_ctrl,
+                        #                                          kl_penalty=self.config.algorithm.kl_penalty)
+                        #     metrics.update(kl_metrics)
+                        # else:
+                        #     batch.batch['token_level_rewards'] = batch.batch['token_level_scores']
 
                         # compute advantages, executed on the driver process
-                        batch = compute_advantage(batch,
-                                                  adv_estimator=self.config.algorithm.adv_estimator,
-                                                  gamma=self.config.algorithm.gamma,
-                                                  lam=self.config.algorithm.lam,
-                                                  num_repeat=self.config.actor_rollout_ref.rollout.n)
+                        # batch = compute_advantage(batch,
+                        #                           adv_estimator=self.config.algorithm.adv_estimator,
+                        #                           gamma=self.config.algorithm.gamma,
+                        #                           lam=self.config.algorithm.lam,
+                        #                           num_repeat=self.config.actor_rollout_ref.rollout.n)
 
                     # update critic
                     if self.use_critic:
@@ -903,7 +997,7 @@ class RayPPOTrainer(object):
                         metrics.update(actor_output_metrics)
 
                     # validate
-                    if self.val_reward_fn is not None and self.config.trainer.test_freq > 0 and \
+                    if self.config.trainer.test_freq > 0 and \
                         (is_last_step or  self.global_steps % self.config.trainer.test_freq == 0):
                         with _timer('testing', timing_raw):
                             val_metrics: dict = self._validate()
@@ -931,3 +1025,4 @@ class RayPPOTrainer(object):
                     return
 
                 self.global_steps += 1
+

@@ -45,11 +45,11 @@ def _compute_response_info(batch: DataProto) -> Dict[str, Any]:
 
 def compute_data_metrics(batch: DataProto, use_critic: bool = True) -> Dict[str, Any]:
     # TODO: add response length
-    sequence_score = batch.batch['token_level_scores'].sum(-1)
-    sequence_reward = batch.batch['token_level_rewards'].sum(-1)
+    sequence_score = batch.batch['final_scores'].sum(-1)
+    sequence_reward = batch.batch['final_scores'].sum(-1)
 
     advantages = batch.batch['advantages']
-    returns = batch.batch['returns']
+    returns = batch.batch['advantages']
 
     max_response_length = batch.batch['responses'].shape[-1]
 
@@ -64,6 +64,10 @@ def compute_data_metrics(batch: DataProto, use_critic: bool = True) -> Dict[str,
 
     valid_adv = torch.masked_select(advantages, response_mask)
     valid_returns = torch.masked_select(returns, response_mask)
+
+    split_scores = batch.batch["budget_scores"]
+    final_split_cnt = batch.batch["final_count"]
+    final_split_scores = batch.batch["final_scores"]
 
     if use_critic:
         values = batch.batch['values']
@@ -128,6 +132,28 @@ def compute_data_metrics(batch: DataProto, use_critic: bool = True) -> Dict[str,
         'prompt_length/clip_ratio':
             torch.mean(torch.eq(prompt_length, max_prompt_length).float()).detach().item(),
     }
+    no_think_end = batch.batch['no_think_end']
+    metrics[f'full_cot/no_think_end'] = torch.sum(no_think_end).detach().item()
+    # final_scores = torch.sum(final_split_scores, dim=-1)
+    no_think_end_avg_score = torch.sum(final_split_scores * no_think_end) / (torch.sum(no_think_end) + 1e-6)
+    metrics[f'full_cot/no_think_end_avg_score'] = no_think_end_avg_score.detach().item()
+    is_formatted = batch.batch['is_formatted']
+
+    split_size = split_scores.size(1)
+    for i in range(split_size):
+        max_score_i = torch.amax(split_scores[:, :i+1], dim=-1)
+        metrics[f'token_budget/{i}/overthink_count'] = torch.sum(max_score_i > split_scores[:, i]).detach().item()
+        metrics[f'token_budget/{i}/max_score'] = torch.mean(max_score_i).detach().item()
+        metrics[f'token_budget/{i}/score'] = torch.mean(split_scores[:, i]).detach().item()
+        metrics[f'token_budget/{i}/is_formatted'] = torch.mean(is_formatted[:, i]).detach().item()
+        avg_final_score = torch.sum(final_split_scores[:, i]) / (torch.sum(final_split_cnt[:, i]) + 1e-6)
+        metrics[f'full_cot/{i}/score'] = avg_final_score.detach().item()
+        metrics[f'full_cot/{i}/count'] = torch.sum(final_split_cnt[:, i]).detach().item()
+        metrics[f'full_cot/{i}/no_think_end'] = torch.sum(no_think_end[:, i]).detach().item()
+    metrics[f'token_budget/avg_score'] = torch.mean(split_scores).detach().item()
+    metrics[f'token_budget/formatted_avg_score'] = (torch.sum(split_scores * is_formatted) / (torch.sum(is_formatted) + 1e-6)).detach().item()
+    avg_final_score = torch.sum(final_split_scores) / (torch.sum(final_split_cnt) + 1e-6)
+    metrics[f'full_cot/avg_score'] = avg_final_score.detach().item()
     return metrics
 
 

@@ -26,10 +26,11 @@ from verl import DataProto
 from verl.trainer.ppo import core_algos
 from verl.workers.actor import BasePPOActor
 from verl.utils.py_functional import append_to_dict
-from verl.utils.torch_functional import logprobs_from_logits, masked_mean
+from verl.utils.torch_functional import logprobs_from_logits, masked_mean, pad_sequence_to_length
 from verl.utils.ulysses import ulysses_pad_and_slice_inputs, gather_outpus_and_unpad
 from verl.utils.seqlen_balancing import rearrange_micro_batches, get_reverse_idx
 import verl.utils.torch_functional as verl_F
+from verl.models.transformers.flex_attn import BLOCK_SIZE, make_flex_block_causal_mask
 
 from flash_attn.bert_padding import pad_input, unpad_input, rearrange, index_first_axis
 
@@ -76,6 +77,7 @@ class DataParallelPPOActor(BasePPOActor):
             batch_size, seqlen = input_ids.shape
             attention_mask = micro_batch['attention_mask']
             position_ids = micro_batch['position_ids']
+            tree_invalid_slice = micro_batch['tree_invalid_slice']
             if position_ids.dim() == 3:  # qwen2vl mrope
                 position_ids = position_ids.transpose(0, 1)  # (bsz, 3, seqlen) -> (3, bsz, seqlen)
 
@@ -83,6 +85,8 @@ class DataParallelPPOActor(BasePPOActor):
                 input_ids_rmpad, indices, *_ = unpad_input(input_ids.unsqueeze(-1),
                                                            attention_mask)  # input_ids_rmpad (total_nnz, ...)
                 input_ids_rmpad = input_ids_rmpad.transpose(0, 1)  # (1, total_nnz)
+                tree_invalid_slice_rmpad = index_first_axis(
+                    rearrange(tree_invalid_slice, "b s ... -> (b s) ..."), indices).transpose(0, 1)  # [2, total_nnz]
 
                 # unpad the position_ids to align the rotary
                 if position_ids.dim() == 3:
@@ -106,13 +110,31 @@ class DataParallelPPOActor(BasePPOActor):
 
                 input_ids_rmpad_rolled = input_ids_rmpad_rolled.squeeze(0)  # ((total_nnz / sp) + pad)
 
-                # only pass input_ids and position_ids to enable flash_attn_varlen
+                # print(f"input: {input_ids_rmpad.shape}, position: {position_ids_rmpad.shape}, indice: {indices.shape}")
+                attn_mask = None  # only pass input_ids and position_ids to enable flash_attn_varlen
+                if self.config.attn_implementation == "flex_attention":
+                    # we need to pad tensors to a static shape because flex_attention has compile issue with dynamic shapes
+                    max_token_len = self.max_token_len
+                    for i in range(len(attention_mask)):
+                        # we pad attention_mask to be divisible by BLOCK_SIZE because flex_attention has numeric issue
+                        count = int(attention_mask[i].sum())
+                        assert count % BLOCK_SIZE == 0
+                    document_ids = (indices // seqlen + 1).unsqueeze(0)  # (1, total_nnz)
+                    document_ids = pad_sequence_to_length(document_ids, max_token_len, 0)
+                    input_ids_rmpad = pad_sequence_to_length(input_ids_rmpad, max_token_len, self.config.pad_token_id)
+                    position_ids_rmpad = pad_sequence_to_length(position_ids_rmpad, max_token_len, 0)
+                    tree_invalid_slice_rmpad = pad_sequence_to_length(tree_invalid_slice_rmpad, max_token_len, 0)
+                    tree_invalid_slice_rmpad = tree_invalid_slice_rmpad.transpose(0, 1).unsqueeze(0)  # [1, total_nnz, 2]
+                    attn_mask = make_flex_block_causal_mask(document_ids, tree_invalid_slice_rmpad)
                 output = self.actor_module(input_ids=input_ids_rmpad,
-                                           attention_mask=None,
-                                           position_ids=position_ids_rmpad,
-                                           **multi_modal_inputs,
-                                           use_cache=False)  # prevent model thinks we are generating
-                logits_rmpad = output.logits.squeeze(0)  # (total_nnz, vocab_size)
+                                            attention_mask=attn_mask,
+                                            position_ids=position_ids_rmpad,
+                                            **multi_modal_inputs,
+                                            use_cache=False)  # prevent model thinks we are generating
+                if self.config.attn_implementation == "flex_attention":
+                    logits_rmpad = output.logits.squeeze(0)[:len(indices)]
+                else:
+                    logits_rmpad = output.logits.squeeze(0)  # (total_nnz, vocab_size)
 
                 logits_rmpad.div_(temperature)
 
@@ -145,8 +167,11 @@ class DataParallelPPOActor(BasePPOActor):
                 log_probs = full_log_probs.squeeze(-1)[:, -response_length - 1:-1]  # (bsz, response_length)
 
             else:  # not using rmpad and no ulysses sp
+                attn_mask = attention_mask
+                if self.config.attn_implementation == "flex_attention":
+                    attn_mask = make_flex_block_causal_mask(attention_mask, tree_invalid_slice)
                 output = self.actor_module(input_ids=input_ids,
-                                           attention_mask=attention_mask,
+                                           attention_mask=attn_mask,
                                            position_ids=position_ids,
                                            **multi_modal_inputs,
                                            use_cache=False)  # prevent model thinks we are generating
@@ -193,7 +218,7 @@ class DataParallelPPOActor(BasePPOActor):
         temperature = data.meta_info['temperature']  # temperature must be in the data.meta_info to avoid slient error
         use_dynamic_bsz = data.meta_info['use_dynamic_bsz']
 
-        select_keys = ['responses', 'input_ids', 'attention_mask', 'position_ids']
+        select_keys = ['responses', 'input_ids', 'attention_mask', 'position_ids', 'tree_invalid_slice']
         batch = data.select(batch_keys=select_keys).batch
         has_multi_modal_inputs = 'multi_modal_inputs' in data.non_tensor_batch.keys()
 
@@ -204,10 +229,12 @@ class DataParallelPPOActor(BasePPOActor):
         elif use_dynamic_bsz:
             # split using dynamic bsz
             max_token_len = data.meta_info['max_token_len'] * self.ulysses_sequence_parallel_size
+            self.max_token_len = max_token_len
             micro_batches, indices = rearrange_micro_batches(batch=batch, max_token_len=max_token_len)
         else:
             micro_batches = batch.split(micro_batch_size)
 
+        # print(f"micro num: {len(micro_batches)}")
         log_probs_lst = []
         for micro_batch in micro_batches:
             if isinstance(micro_batch, DataProto):
@@ -232,7 +259,7 @@ class DataParallelPPOActor(BasePPOActor):
 
         temperature = data.meta_info['temperature']  # temperature must be in the data.meta_info to avoid slient error
 
-        select_keys = ['responses', 'input_ids', 'attention_mask', 'position_ids', 'old_log_probs', 'advantages']
+        select_keys = ['responses', 'input_ids', 'attention_mask', 'position_ids', 'old_log_probs', 'advantages', 'tree_invalid_slice', 'trainable_mask']
         if self.config.use_kl_loss:
             select_keys.append('ref_log_prob')
         batch = data.select(batch_keys=select_keys).batch
@@ -247,6 +274,8 @@ class DataParallelPPOActor(BasePPOActor):
         else:
             dataloader = batch.split(self.config.ppo_mini_batch_size)
 
+        batch_size = len(batch)
+        print(f"batch size {batch_size}, mini batch size {self.config.ppo_mini_batch_size}, micro batch size {self.config.ppo_micro_batch_size_per_gpu}")
         metrics = {}
         for epoch in range(self.config.ppo_epochs):
             for batch_idx, data in enumerate(dataloader):
@@ -258,6 +287,7 @@ class DataParallelPPOActor(BasePPOActor):
                     micro_batches = data.select(select_keys, non_tensor_select_keys).chunk(num_micro_batches)
                 elif self.config.use_dynamic_bsz:
                     max_token_len = self.config.ppo_max_token_len_per_gpu * self.ulysses_sequence_parallel_size
+                    self.max_token_len = max_token_len
                     micro_batches, _ = rearrange_micro_batches(batch=mini_batch, max_token_len=max_token_len)
                 else:
                     self.gradient_accumulation = self.config.ppo_mini_batch_size // self.config.ppo_micro_batch_size_per_gpu
@@ -266,6 +296,7 @@ class DataParallelPPOActor(BasePPOActor):
 
                 self.actor_optimizer.zero_grad()
 
+                # print(f"micro num: {len(micro_batches)}")
                 for data in micro_batches:
                     # Support all hardwares
                     if isinstance(data, DataProto):
@@ -273,9 +304,12 @@ class DataParallelPPOActor(BasePPOActor):
                     else:
                         data = data.to(torch.cuda.current_device())  # actor device is cpu when using offload
                     responses = data['responses']
+                    # print(f"micro size: {len(responses)}")
                     response_length = responses.size(1)
                     attention_mask = data['attention_mask']
                     response_mask = attention_mask[:, -response_length:]
+                    trainable_mask = data['trainable_mask']
+                    response_mask = response_mask.logical_and(trainable_mask)
                     old_log_prob = data['old_log_probs']
                     advantages = data['advantages']
 
@@ -285,14 +319,14 @@ class DataParallelPPOActor(BasePPOActor):
                     # all return: (bsz, response_length)
                     entropy, log_prob = self._forward_micro_batch(micro_batch=data, temperature=temperature)
 
-                    pg_loss, pg_clipfrac, ppo_kl = core_algos.compute_policy_loss(old_log_prob=old_log_prob,
-                                                                                  log_prob=log_prob,
-                                                                                  advantages=advantages,
-                                                                                  eos_mask=response_mask,
-                                                                                  cliprange=clip_ratio)
+                    pg_loss, pg_clipfrac, ppo_kl, max_log_ratio, min_log_ratio = core_algos.compute_policy_loss(
+                        old_log_prob=old_log_prob,
+                        log_prob=log_prob,
+                        advantages=advantages,
+                        eos_mask=response_mask,
+                        cliprange=clip_ratio)
                     # compute entropy loss from entropy
-                    entropy_loss = verl_F.masked_mean(entropy, response_mask)
-
+                    entropy_loss = verl_F.just_mean(entropy, response_mask)
                     # compute policy loss
                     policy_loss = pg_loss - entropy_loss * entropy_coeff
 
@@ -302,7 +336,7 @@ class DataParallelPPOActor(BasePPOActor):
                         kld = core_algos.kl_penalty(logprob=log_prob,
                                                     ref_logprob=ref_log_prob,
                                                     kl_penalty=self.config.kl_loss_type)
-                        kl_loss = masked_mean(kld, response_mask)
+                        kl_loss = verl_F.just_mean(kld, response_mask)
 
                         policy_loss = policy_loss + kl_loss * self.config.kl_loss_coef
                         metrics['actor/kl_loss'] = kl_loss.detach().item()
@@ -310,7 +344,7 @@ class DataParallelPPOActor(BasePPOActor):
 
                     if self.config.use_dynamic_bsz:
                         # relative to the dynamic bsz
-                        loss = policy_loss * (len(data) / self.config.ppo_mini_batch_size)
+                        loss = policy_loss * (len(responses) / self.config.ppo_mini_batch_size)
                     else:
                         loss = policy_loss / self.gradient_accumulation
                     loss.backward()
@@ -319,10 +353,13 @@ class DataParallelPPOActor(BasePPOActor):
                         'actor/entropy_loss': entropy_loss.detach().item(),
                         'actor/pg_loss': pg_loss.detach().item(),
                         'actor/pg_clipfrac': pg_clipfrac.detach().item(),
+                        'actor/max_log_ratio': max_log_ratio.detach().item(),
+                        'actor/min_log_ratio': min_log_ratio.detach().item(),
                         'actor/ppo_kl': ppo_kl.detach().item(),
                     }
                     append_to_dict(metrics, data)
 
+                # print(f"metrics: {metrics}")
                 grad_norm = self._optimizer_step()
                 data = {'actor/grad_norm': grad_norm.detach().item()}
             append_to_dict(metrics, data)

@@ -23,6 +23,7 @@ import psutil
 import torch
 import torch.distributed
 from torch.distributed.device_mesh import init_device_mesh
+from verl.models.transformers.flex_attn import update_flex_attn_impl
 import verl.utils.torch_functional as verl_F
 from omegaconf import DictConfig, open_dict
 from verl import DataProto
@@ -183,6 +184,9 @@ class ActorRolloutRefWorker(Worker):
             from verl.models.transformers.monkey_patch import apply_monkey_patch
             apply_monkey_patch(actor_model_config, verbose=True)
 
+        if self._is_actor and self.config.actor.attn_implementation == "flex_attention":
+            with update_flex_attn_impl(permanent=True):
+                pass
         override_config_kwargs = {
             'bos_token_id': self.tokenizer.bos_token_id,
             'eos_token_id': self.tokenizer.eos_token_id,
@@ -207,7 +211,7 @@ class ActorRolloutRefWorker(Worker):
             actor_module = actor_module_class.from_pretrained(pretrained_model_name_or_path=local_path,
                                                               torch_dtype=torch_dtype,
                                                               config=actor_model_config,
-                                                              attn_implementation='flash_attention_2',
+                                                              attn_implementation=self.config.actor.attn_implementation,
                                                               trust_remote_code=trust_remote_code)
             # Apply Liger kernel to the model if use_liger is set to True
             if use_liger:
@@ -384,6 +388,7 @@ class ActorRolloutRefWorker(Worker):
             OmegaConf.set_struct(self.config.actor, True)
             with open_dict(self.config.actor):
                 self.config.actor.use_remove_padding = use_remove_padding
+                self.config.actor.pad_token_id = self.tokenizer.pad_token_id
             self.actor = DataParallelPPOActor(config=self.config.actor,
                                               actor_module=self.actor_module_fsdp,
                                               actor_optimizer=self.actor_optimizer)
@@ -430,8 +435,12 @@ class ActorRolloutRefWorker(Worker):
         with self.ulysses_sharding_manager:
             data = self.ulysses_sharding_manager.preprocess_data(data=data)
             # perform training
-            with Timer(name='update_policy', logger=None) as timer:
-                metrics = self.actor.update_policy(data=data)
+            try:
+                with Timer(name='update_policy', logger=None) as timer:
+                    metrics = self.actor.update_policy(data=data)
+            except Exception as e:
+                print(f"Error in update_policy: {e}")
+                raise e
             delta_time = timer.last
             global_num_tokens = data.meta_info['global_token_num']
             estimated_flops, promised_flops = self.flops_counter.estimate_flops(global_num_tokens, delta_time)
@@ -514,13 +523,17 @@ class ActorRolloutRefWorker(Worker):
         data.meta_info['max_token_len'] = self.config.rollout.log_prob_max_token_len_per_gpu
         data.meta_info['use_dynamic_bsz'] = self.config.rollout.log_prob_use_dynamic_bsz
         data.meta_info['temperature'] = self.config.rollout.temperature
-        # perform recompute log_prob
-        with self.ulysses_sharding_manager:
-            data = self.ulysses_sharding_manager.preprocess_data(data)
-            output = self.actor.compute_log_prob(data=data)
-            output = DataProto.from_dict(tensors={'old_log_probs': output},
-                                         meta_info={'temperature': self.config.rollout.temperature})
-            output = self.ulysses_sharding_manager.postprocess_data(output)
+        try:
+            # perform recompute log_prob
+            with self.ulysses_sharding_manager:
+                data = self.ulysses_sharding_manager.preprocess_data(data)
+                output = self.actor.compute_log_prob(data=data)
+                output = DataProto.from_dict(tensors={'old_log_probs': output},
+                                            meta_info={'temperature': self.config.rollout.temperature})
+                output = self.ulysses_sharding_manager.postprocess_data(output)
+        except Exception as e:
+            print(f"Error in update_policy: {e}")
+            raise e
 
         output = output.to('cpu')
 
